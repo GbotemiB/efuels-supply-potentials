@@ -2,6 +2,8 @@
 """
 upload_to_zenodo.py
 Upload prepared files to an existing Zenodo deposit via the REST API.
+Supports resumable uploads: if a connection drops mid-upload, re-running
+the script will automatically continue from the last successful byte.
 
 Usage:
     python upload_to_zenodo.py --staging-dir /path/to/staging [--deposit-id 18487278] [--dry-run]
@@ -17,6 +19,7 @@ Environment:
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -41,6 +44,10 @@ SCENARIO_NAMES = [f"US_scenario_{i:02d}" for i in range(1, 11)]
 # Repo-root files to include (relative to the repo root, located two levels
 # above this script: zenodo/scripts/upload_to_zenodo.py → ../../)
 REPO_ROOT_FILES = ["README.md", "LICENSE"]
+
+CHUNK_SIZE = 8 * 1024 * 1024   # 8 MB per chunk
+MAX_RETRIES = 5                 # retries per chunk on connection error
+RETRY_BACKOFF = 5               # seconds between retries (doubles each attempt)
 
 
 # ---------------------------------------------------------------------------
@@ -70,55 +77,100 @@ def fetch_deposit(deposit_id: int, token: str) -> dict:
     return r.json()
 
 
+def get_uploaded_size(bucket_url: str, filename: str, token: str) -> int:
+    """Return how many bytes Zenodo already has for this file (0 if none)."""
+    r = requests.head(
+        f"{bucket_url}/{filename}",
+        params={"access_token": token},
+        allow_redirects=True,
+    )
+    if r.status_code == 200:
+        return int(r.headers.get("Content-Length", 0))
+    return 0
+
+
 def stream_upload(bucket_url: str, file_path: Path, token: str, dry_run: bool) -> None:
     filename = file_path.name
-    size_mb = file_path.stat().st_size / (1024 ** 2)
-    print(f"  → {filename}  ({size_mb:.1f} MB)", end="", flush=True)
-
-    if dry_run:
-        print("  [DRY RUN — skipped]")
-        return
-
+    total_size = file_path.stat().st_size
+    size_mb = total_size / (1024 ** 2)
     url = f"{bucket_url}/{filename}"
 
+    if dry_run:
+        print(f"  → {filename}  ({size_mb:.1f} MB)  [DRY RUN — skipped]")
+        return
+
+    # Check how much has already been uploaded (resume support)
+    offset = get_uploaded_size(bucket_url, filename, token)
+    if offset >= total_size:
+        print(f"  → {filename}  ({size_mb:.1f} MB)  [already complete — skipped]")
+        return
+
+    if offset > 0:
+        print(f"  → {filename}  ({size_mb:.1f} MB)  [resuming from {offset / (1024**2):.1f} MB]")
+    else:
+        print(f"  → {filename}  ({size_mb:.1f} MB)")
+
+    bar = None
     if HAS_TQDM:
-        with open(file_path, "rb") as fh:
-            with tqdm(
-                total=file_path.stat().st_size,
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-                desc=f"    {filename}",
-                leave=False,
-            ) as bar:
-                def _read_chunks(f, chunk=1024 * 1024):
-                    while True:
-                        data = f.read(chunk)
-                        if not data:
-                            break
-                        bar.update(len(data))
-                        yield data
+        bar = tqdm(
+            total=total_size,
+            initial=offset,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            leave=True,
+        )
 
-                r = requests.put(
-                    url,
-                    data=_read_chunks(fh),
-                    params={"access_token": token},
-                    headers={"Content-Type": "application/octet-stream"},
-                )
-    else:
-        with open(file_path, "rb") as fh:
-            r = requests.put(
-                url,
-                data=fh,
-                params={"access_token": token},
-                headers={"Content-Type": "application/octet-stream"},
-            )
+    with open(file_path, "rb") as fh:
+        fh.seek(offset)
+        current_offset = offset
 
-    if r.status_code in (200, 201):
-        print("  ✓")
-    else:
-        print(f"\n  ERROR {r.status_code}: {r.text}")
-        sys.exit(f"Upload failed for {filename}")
+        while current_offset < total_size:
+            chunk = fh.read(CHUNK_SIZE)
+            if not chunk:
+                break
+
+            chunk_end = current_offset + len(chunk) - 1
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {current_offset}-{chunk_end}/{total_size}",
+                "Content-Length": str(len(chunk)),
+            }
+
+            # Retry loop for each chunk
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    r = requests.put(
+                        url,
+                        data=chunk,
+                        params={"access_token": token},
+                        headers=headers,
+                        timeout=300,
+                    )
+                    if r.status_code in (200, 201, 206):
+                        break
+                    else:
+                        print(f"\n  Chunk error {r.status_code} (attempt {attempt}/{MAX_RETRIES}): {r.text[:200]}")
+                except requests.exceptions.ConnectionError as e:
+                    print(f"\n  Connection error (attempt {attempt}/{MAX_RETRIES}): {e}")
+
+                if attempt == MAX_RETRIES:
+                    if bar:
+                        bar.close()
+                    sys.exit(f"Upload failed after {MAX_RETRIES} retries at byte {current_offset}.")
+
+                wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+                print(f"  Retrying in {wait}s...")
+                time.sleep(wait)
+
+            if bar:
+                bar.update(len(chunk))
+            current_offset += len(chunk)
+
+    if bar:
+        bar.close()
+
+    print(f"  ✓  {filename}")
 
 
 def collect_files(staging_dir: Path, repo_root: Path) -> list[tuple[Path, str]]:

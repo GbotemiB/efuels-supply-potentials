@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this dataset, please cite it as below."
+type: dataset
+authors:
+  - family-names: "Bolarinwa"
+    given-names: "Gino"
+    affiliation: "Open Energy Transition gGmbH (OET)"
+    orcid: ""  # Add your ORCID here, e.g. "https://orcid.org/0000-0000-0000-0000"
+title: "E-fuels Supply Potentials: Scenario Results and Input Data for North American Energy Transition Modeling"
+date-released: 2026-03-10
+url: "https://github.com/open-energy-transition/efuels-supply-potentials"
+repository-code: "https://github.com/open-energy-transition/efuels-supply-potentials"
+license: CC-BY-4.0
+keywords:
+  - energy transition
+  - power systems
+  - sustainable aviation fuel
+  - e-kerosene
+  - SAF mandate
+  - North America
+  - PyPSA
+  - PyPSA-Earth
+  - e-fuels
+  - energy modeling
+abstract: >
+  This dataset contains results and input data for the e-fuels supply potentials project,
+  which models North American energy transition pathways under various sustainable aviation
+  fuel (SAF / e-kerosene) blending mandates. The archive includes 10 scenario runs
+  (US_scenario_01 through US_scenario_10), each consisting of solved PyPSA-Earth network
+  files and solver logs, plus the ERA5 North America cutout used for renewable resource
+  assessment.

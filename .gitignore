@@ -12,3 +12,6 @@ data/icct/aviation_demand.csv
 .idea/
 notebooks/results/
 .pytest_cache/
+
+# Zenodo upload — local secrets
+zenodo/.env

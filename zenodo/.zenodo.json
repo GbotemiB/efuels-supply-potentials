@@ -1,0 +1,34 @@
+{
+  "title": "E-fuels Supply Potentials: Scenario Results and Input Data for North American Energy Transition Modeling",
+  "description": "Archive of scenario results and input data for the e-fuels supply potentials project, modeling North American energy transition pathways with sustainable aviation fuel (SAF) mandates. Contains 10 scenario runs (US_scenario_01 through US_scenario_10), each with solved network files (network.nc) and solver logs, plus the ERA5 cutout used for renewable resource assessment.",
+  "upload_type": "dataset",
+  "access_right": "open",
+  "license": "cc-by-4.0",
+  "creators": [
+    {
+      "name": "Bolarinwa, Gino",
+      "affiliation": "Open Energy Transition gGmbH (OET)",
+      "orcid": ""
+    }
+  ],
+  "keywords": [
+    "energy transition",
+    "power systems",
+    "sustainable aviation fuel",
+    "e-kerosene",
+    "SAF mandate",
+    "North America",
+    "PyPSA",
+    "PyPSA-Earth",
+    "energy modeling",
+    "e-fuels"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/open-energy-transition/efuels-supply-potentials",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ],
+  "language": "eng"
+}

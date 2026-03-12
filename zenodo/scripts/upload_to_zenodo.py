@@ -2,8 +2,14 @@
 """
 upload_to_zenodo.py
 Upload prepared files to an existing Zenodo deposit via the REST API.
-Supports resumable uploads: if a connection drops mid-upload, re-running
-the script will automatically continue from the last successful byte.
+
+Resume strategy for large files:
+  Zenodo does not support server-side Content-Range reassembly — each PUT
+  replaces the whole file. Files larger than LARGE_FILE_THRESHOLD are split
+  into PART_SIZE pieces and uploaded as separate Zenodo files
+  (e.g. cutout_northamerica.zip.part001). On re-run, parts that already
+  exist on Zenodo with the correct byte size are skipped automatically.
+  A reassembly command is printed at the end.
 
 Usage:
     python upload_to_zenodo.py --staging-dir /path/to/staging [--deposit-id 18487278] [--dry-run]
@@ -17,6 +23,7 @@ Environment:
 """
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -45,9 +52,12 @@ SCENARIO_NAMES = [f"US_scenario_{i:02d}" for i in range(1, 11)]
 # above this script: zenodo/scripts/upload_to_zenodo.py → ../../)
 REPO_ROOT_FILES = ["README.md", "LICENSE"]
 
-CHUNK_SIZE = 8 * 1024 * 1024   # 8 MB per chunk
-MAX_RETRIES = 5                 # retries per chunk on connection error
-RETRY_BACKOFF = 5               # seconds between retries (doubles each attempt)
+# Files larger than this threshold are split into parts before uploading
+LARGE_FILE_THRESHOLD = 2 * 1024 ** 3    # 2 GB
+PART_SIZE            = 500 * 1024 ** 2  # 500 MB per part
+
+MAX_RETRIES   = 5
+RETRY_BACKOFF = 10  # seconds for first retry (doubles each time)
 
 
 # ---------------------------------------------------------------------------
@@ -77,120 +87,133 @@ def fetch_deposit(deposit_id: int, token: str) -> dict:
     return r.json()
 
 
-def get_uploaded_size(bucket_url: str, filename: str, token: str) -> int:
-    """Return how many bytes Zenodo already has for this file (0 if none)."""
+def remote_file_size(bucket_url: str, filename: str, token: str) -> int:
+    """
+    Return the committed size of a file on Zenodo, or 0 if absent.
+    Zenodo only returns Content-Length for fully committed files — a failed
+    or partial upload leaves no trace, so 0 means 'not yet uploaded'.
+    """
     r = requests.head(
         f"{bucket_url}/{filename}",
         params={"access_token": token},
         allow_redirects=True,
+        timeout=30,
     )
     if r.status_code == 200:
         return int(r.headers.get("Content-Length", 0))
     return 0
 
 
-def stream_upload(bucket_url: str, file_path: Path, token: str, dry_run: bool) -> None:
+def _put_bytes(url: str, data: bytes, token: str, label: str) -> None:
+    """PUT a complete byte buffer, retrying with exponential backoff on errors."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.put(
+                url,
+                data=data,
+                params={"access_token": token},
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=600,
+            )
+            if r.status_code in (200, 201):
+                return
+            print(f"\n  Server error {r.status_code} on '{label}' (attempt {attempt}): {r.text[:300]}")
+        except requests.exceptions.ConnectionError as exc:
+            print(f"\n  Connection error on '{label}' (attempt {attempt}/{MAX_RETRIES}): {exc}")
+
+        if attempt == MAX_RETRIES:
+            sys.exit(f"Upload failed after {MAX_RETRIES} retries: {label}")
+
+        wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+        print(f"  Retrying in {wait}s...")
+        time.sleep(wait)
+
+
+def upload_whole_file(bucket_url: str, file_path: Path, token: str, dry_run: bool) -> None:
+    """Upload a single file as one atomic PUT. Skips if Zenodo already has the exact size."""
     filename = file_path.name
-    total_size = file_path.stat().st_size
-    size_mb = total_size / (1024 ** 2)
-    url = f"{bucket_url}/{filename}"
+    total = file_path.stat().st_size
 
+    existing = remote_file_size(bucket_url, filename, token)
+    if existing == total:
+        print(f"  -> {filename}  ({total / 1024**2:.1f} MB)  [already on Zenodo - skipped]")
+        return
+
+    print(f"  -> {filename}  ({total / 1024**2:.1f} MB)")
     if dry_run:
-        print(f"  → {filename}  ({size_mb:.1f} MB)  [DRY RUN — skipped]")
         return
-
-    # Check how much has already been uploaded (resume support)
-    offset = get_uploaded_size(bucket_url, filename, token)
-    if offset >= total_size:
-        print(f"  → {filename}  ({size_mb:.1f} MB)  [already complete — skipped]")
-        return
-
-    if offset > 0:
-        print(f"  → {filename}  ({size_mb:.1f} MB)  [resuming from {offset / (1024**2):.1f} MB]")
-    else:
-        print(f"  → {filename}  ({size_mb:.1f} MB)")
-
-    bar = None
-    if HAS_TQDM:
-        bar = tqdm(
-            total=total_size,
-            initial=offset,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-            leave=True,
-        )
 
     with open(file_path, "rb") as fh:
-        fh.seek(offset)
-        current_offset = offset
+        data = fh.read()
 
-        while current_offset < total_size:
-            chunk = fh.read(CHUNK_SIZE)
-            if not chunk:
-                break
+    if HAS_TQDM:
+        bar = tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024, leave=True)
 
-            chunk_end = current_offset + len(chunk) - 1
-            headers = {
-                "Content-Type": "application/octet-stream",
-                "Content-Range": f"bytes {current_offset}-{chunk_end}/{total_size}",
-                "Content-Length": str(len(chunk)),
-            }
+    _put_bytes(f"{bucket_url}/{filename}", data, token, filename)
 
-            # Retry loop for each chunk
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    r = requests.put(
-                        url,
-                        data=chunk,
-                        params={"access_token": token},
-                        headers=headers,
-                        timeout=300,
-                    )
-                    if r.status_code in (200, 201, 206):
-                        break
-                    else:
-                        print(f"\n  Chunk error {r.status_code} (attempt {attempt}/{MAX_RETRIES}): {r.text[:200]}")
-                except requests.exceptions.ConnectionError as e:
-                    print(f"\n  Connection error (attempt {attempt}/{MAX_RETRIES}): {e}")
-
-                if attempt == MAX_RETRIES:
-                    if bar:
-                        bar.close()
-                    sys.exit(f"Upload failed after {MAX_RETRIES} retries at byte {current_offset}.")
-
-                wait = RETRY_BACKOFF * (2 ** (attempt - 1))
-                print(f"  Retrying in {wait}s...")
-                time.sleep(wait)
-
-            if bar:
-                bar.update(len(chunk))
-            current_offset += len(chunk)
-
-    if bar:
+    if HAS_TQDM:
+        bar.update(total)
         bar.close()
 
-    print(f"  ✓  {filename}")
+    print("  done")
 
 
-def collect_files(staging_dir: Path, repo_root: Path) -> list[tuple[Path, str]]:
+def upload_in_parts(bucket_url: str, file_path: Path, token: str, dry_run: bool) -> list:
+    """
+    Split file into PART_SIZE slices, upload each as its own Zenodo file.
+    Parts matching their expected size on Zenodo are skipped (true resume).
+    Returns list of part filenames for reassembly.
+    """
+    total = file_path.stat().st_size
+    n_parts = math.ceil(total / PART_SIZE)
+    stem = file_path.name
+    part_names = [f"{stem}.part{i + 1:03d}" for i in range(n_parts)]
+
+    print(
+        f"  -> {stem}  ({total / 1024**3:.2f} GB)  "
+        f"splitting into {n_parts} parts x {PART_SIZE // 1024**2} MB"
+    )
+
+    if dry_run:
+        for p in part_names:
+            print(f"     [DRY RUN] {p}")
+        return part_names
+
+    with open(file_path, "rb") as fh:
+        for i, part_name in enumerate(part_names):
+            fh.seek(i * PART_SIZE)
+            chunk = fh.read(PART_SIZE)
+            expected = len(chunk)
+
+            existing = remote_file_size(bucket_url, part_name, token)
+            if existing == expected:
+                print(f"  [{i + 1:3d}/{n_parts}] {part_name}  ({expected / 1024**2:.1f} MB)  [skipped]")
+                continue
+
+            print(f"  [{i + 1:3d}/{n_parts}] {part_name}  ({expected / 1024**2:.1f} MB) ...", end="", flush=True)
+
+            if HAS_TQDM:
+                bar = tqdm(total=expected, unit="B", unit_scale=True, unit_divisor=1024, leave=False)
+
+            _put_bytes(f"{bucket_url}/{part_name}", chunk, token, part_name)
+
+            if HAS_TQDM:
+                bar.update(expected)
+                bar.close()
+
+            print("  done")
+
+    return part_names
+
+
+def collect_files(staging_dir: Path, repo_root: Path) -> list:
     """Return list of (absolute_path, display_label) for all files to upload."""
     files = []
-
-    # Scenario zips
     for name in SCENARIO_NAMES:
-        p = staging_dir / f"{name}.zip"
-        files.append((p, f"scenario: {name}.zip"))
-
-    # Cutout
-    cutout = staging_dir / "cutout_northamerica.zip"
-    files.append((cutout, "cutout: cutout_northamerica.zip"))
-
-    # Repo-root files
+        files.append((staging_dir / f"{name}.zip", f"scenario: {name}.zip"))
+    files.append((staging_dir / "cutout_northamerica.zip", "cutout: cutout_northamerica.zip"))
     for fname in REPO_ROOT_FILES:
-        p = repo_root / fname
-        files.append((p, f"repo: {fname}"))
-
+        files.append((repo_root / fname, f"repo: {fname}"))
     return files
 
 
@@ -259,17 +282,29 @@ def main():
     else:
         bucket_url = "https://zenodo.org/api/files/DRY-RUN-BUCKET"
 
-    # Upload
+    reassemble_parts = {}
+
     for i, (file_path, label) in enumerate(files, 1):
         print(f"[{i:2d}/{len(files)}] {label}")
-        stream_upload(bucket_url, file_path, token, args.dry_run)
+        if file_path.stat().st_size > LARGE_FILE_THRESHOLD:
+            parts = upload_in_parts(bucket_url, file_path, token, args.dry_run)
+            reassemble_parts[file_path.name] = parts
+        else:
+            upload_whole_file(bucket_url, file_path, token, args.dry_run)
+        print()
 
-    print()
     if args.dry_run:
-        print("Dry run complete. Re-run without --dry-run to upload for real.")
+        print("Dry run complete. Re-run without --dry-run to upload.")
     else:
-        print(f"All files uploaded successfully.")
-        print(f"Review your draft at: https://zenodo.org/uploads/{args.deposit_id}")
+        print("All files uploaded successfully.")
+        print(f"Review your draft: https://zenodo.org/uploads/{args.deposit_id}")
+
+    if reassemble_parts:
+        print("\n--- Reassembly commands (run after downloading from Zenodo) ---")
+        for original, parts in reassemble_parts.items():
+            print(f"\n# {original}")
+            print(f"cat {' '.join(parts)} > {original}")
+            print(f"# verify: md5sum {original}")
 
 
 if __name__ == "__main__":

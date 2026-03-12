@@ -28,9 +28,9 @@
 #SBATCH --output=zenodo/logs/upload_%j.out
 #SBATCH --error=zenodo/logs/upload_%j.err
 #SBATCH --time=12:00:00          # 12 h should be more than enough
-#SBATCH --cpus-per-task=4        # zip benefits from parallelism (-@ flag not used here, safe default)
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
-#SBATCH --partition=medium       # ← CHANGE to your internet-connected partition
+#SBATCH --partition=gcp1-cmp     # GCP nodes have outbound internet; regular htc-cmp nodes do not
 # #SBATCH --qos=normal           # uncomment / adjust if your cluster uses QOS
 
 # ---------------------------------------------------------------------------

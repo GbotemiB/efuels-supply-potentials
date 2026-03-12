@@ -9,8 +9,8 @@ Resume strategy for large files (file splitting):
       cutout_northamerica.zip.part_001
       cutout_northamerica.zip.part_002  …
   A companion  cutout_northamerica.zip_REASSEMBLE.txt  is also uploaded with
-  the one-liner needed to reassemble on the downloader's machine:
-      cat cutout_northamerica.zip.part_* > cutout_northamerica.zip
+  a self-contained Python reassembly script for downloaders:
+      python cutout_northamerica.zip_REASSEMBLE.py
   Resume: before uploading each part the script checks whether Zenodo already
   holds a file of the correct size and skips it if so.
 
@@ -165,12 +165,70 @@ def upload_whole_file(bucket_url: str, file_path: Path, token: str, dry_run: boo
 # File-splitting upload (used for large files)
 # ---------------------------------------------------------------------------
 
+def _make_reassemble_script(filename: str) -> bytes:
+    """Return the source of a standalone Python reassembly script for downloaders."""
+    return f'''\
+#!/usr/bin/env python3
+"""
+Reassemble {filename} from its downloaded parts.
+
+Steps:
+  1. Download ALL files named  {filename}.part_*  and this script
+     into the same folder.
+  2. Open a terminal / command prompt in that folder.
+  3. Run:   python {filename}_REASSEMBLE.py
+
+No extra software needed — only Python (already installed on most computers).
+Download Python from https://www.python.org/downloads/ if needed.
+"""
+
+import glob
+import os
+import sys
+
+FILENAME = "{filename}"
+PARTS_PATTERN = FILENAME + ".part_*"
+
+
+def main():
+    parts = sorted(glob.glob(PARTS_PATTERN))
+    if not parts:
+        sys.exit(
+            f"No part files found matching \\'{{PARTS_PATTERN}}\\'.\\n"
+            "Make sure you have downloaded all .part_* files into this folder."
+        )
+
+    total_size = sum(os.path.getsize(p) for p in parts)
+    print(f"Found {{len(parts)}} parts  ({{total_size / 1024**3:.2f}} GB total)")
+    print(f"Writing \\'{{FILENAME}}\\'...")
+
+    written = 0
+    with open(FILENAME, "wb") as out:
+        for i, part in enumerate(parts, 1):
+            size = os.path.getsize(part)
+            print(f"  [{{i:3d}}/{{len(parts)}}] {{part}}  ({{size / 1024**2:.0f}} MB)",
+                  end="", flush=True)
+            with open(part, "rb") as fh:
+                out.write(fh.read())
+            written += size
+            print(f"  {{written / total_size * 100:.0f}}% complete")
+
+    print(f"\\nDone!  \\'{{FILENAME}}\\' written  ({{written / 1024**3:.2f}} GB).")
+    print("You can now delete the .part_* files and this script.")
+
+
+if __name__ == "__main__":
+    main()
+'''.encode()
+
+
 def upload_in_parts(bucket_url: str, file_path: Path, token: str,
                     dry_run: bool) -> None:
     """
     Split a large file into PART_SIZE chunks and upload each as an independent
-    Zenodo file.  A small companion *_REASSEMBLE.txt is also uploaded so
-    downloaders know exactly what to run.
+    Zenodo file.  A companion Python script *_REASSEMBLE.py is also uploaded —
+    downloaders just run  python cutout_northamerica.zip_REASSEMBLE.py  in the
+    folder where they saved the parts; no shell knowledge required.
 
     Resume: before uploading each part, the script checks whether Zenodo
     already holds a file of the correct size and skips it if so.
@@ -183,20 +241,15 @@ def upload_in_parts(bucket_url: str, file_path: Path, token: str,
           f"[splitting: {n_parts} parts x {PART_SIZE // 1024**2} MB]")
     if dry_run:
         print(f"     Parts will be named {filename}.part_001 … .part_{n_parts:03d}")
-        print(f"     Reassembly instructions → {filename}_REASSEMBLE.txt")
+        print(f"     Reassembly script   → {filename}_REASSEMBLE.py")
         return
 
-    # Upload a small reassembly README first so it's present even if we abort
-    readme_name = f"{filename}_REASSEMBLE.txt"
-    readme_body = (
-        f"To reassemble {filename} after downloading all parts, run:\n\n"
-        f"  cat {filename}.part_* > {filename}\n\n"
-        f"(Works on Linux, macOS, and WSL.  On Windows PowerShell use:\n"
-        f"  Get-Content {filename}.part_* -Raw | Set-Content -Path {filename} -AsByteStream)\n"
-    ).encode()
-    if remote_file_size(bucket_url, readme_name, token) == 0:
-        print(f"  Uploading reassembly instructions → {readme_name}")
-        _put_bytes(f"{bucket_url}/{readme_name}", readme_body, token, readme_name)
+    # Upload the reassembly script first so it's present even if we abort mid-run
+    script_name = f"{filename}_REASSEMBLE.py"
+    if remote_file_size(bucket_url, script_name, token) == 0:
+        print(f"  Uploading reassembly script → {script_name}")
+        _put_bytes(f"{bucket_url}/{script_name}",
+                   _make_reassemble_script(filename), token, script_name)
 
     with open(file_path, "rb") as fh:
         for part_num in range(1, n_parts + 1):
@@ -214,8 +267,8 @@ def upload_in_parts(bucket_url: str, file_path: Path, token: str,
             _put_bytes(f"{bucket_url}/{part_name}", chunk, token, part_name)
             print(" done")
 
-    print(f"  All {n_parts} parts uploaded.  "
-          f"Downloaders reassemble with: cat {filename}.part_* > {filename}")
+    print(f"  All {n_parts} parts uploaded.")
+    print(f"  Downloaders run: python {script_name}")
 
 
 def collect_files(staging_dir: Path, repo_root: Path) -> list:

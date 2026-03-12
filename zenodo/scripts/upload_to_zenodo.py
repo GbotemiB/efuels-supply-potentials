@@ -3,13 +3,15 @@
 upload_to_zenodo.py
 Upload prepared files to an existing Zenodo deposit via the REST API.
 
-Resume strategy for large files:
-  Zenodo does not support server-side Content-Range reassembly — each PUT
-  replaces the whole file. Files larger than LARGE_FILE_THRESHOLD are split
-  into PART_SIZE pieces and uploaded as separate Zenodo files
-  (e.g. cutout_northamerica.zip.part001). On re-run, parts that already
-  exist on Zenodo with the correct byte size are skipped automatically.
-  A reassembly command is printed at the end.
+Resume strategy for large files (S3 multipart):
+  Files larger than LARGE_FILE_THRESHOLD are uploaded using the S3 multipart
+  protocol exposed by Zenodo's bucket API.
+    1. POST  {bucket}/{file}?uploads             → get UploadId
+    2. PUT   {bucket}/{file}?partNumber=N&uploadId=ID  → upload each part
+    3. POST  {bucket}/{file}?uploadId=ID         → complete (Zenodo assembles)
+  Downloaders see a single file — no reassembly needed.
+  Progress is saved to .upload_state_{filename}.json in the staging dir.
+  On re-run, already-uploaded parts are skipped automatically.
 
 Usage:
     python upload_to_zenodo.py --staging-dir /path/to/staging [--deposit-id 18487278] [--dry-run]
@@ -23,11 +25,13 @@ Environment:
 """
 
 import argparse
+import json
 import math
 import os
 import sys
 import time
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import requests
 from dotenv import load_dotenv
@@ -158,52 +162,190 @@ def upload_whole_file(bucket_url: str, file_path: Path, token: str, dry_run: boo
     print("  done")
 
 
-def upload_in_parts(bucket_url: str, file_path: Path, token: str, dry_run: bool) -> list:
-    """
-    Split file into PART_SIZE slices, upload each as its own Zenodo file.
-    Parts matching their expected size on Zenodo are skipped (true resume).
-    Returns list of part filenames for reassembly.
-    """
-    total = file_path.stat().st_size
-    n_parts = math.ceil(total / PART_SIZE)
-    stem = file_path.name
-    part_names = [f"{stem}.part{i + 1:03d}" for i in range(n_parts)]
+# ---------------------------------------------------------------------------
+# S3 multipart upload (used for large files)
+# ---------------------------------------------------------------------------
 
-    print(
-        f"  -> {stem}  ({total / 1024**3:.2f} GB)  "
-        f"splitting into {n_parts} parts x {PART_SIZE // 1024**2} MB"
+def _state_path(staging_dir: Path, filename: str) -> Path:
+    return staging_dir / f".upload_state_{filename}.json"
+
+
+def _load_state(staging_dir: Path, filename: str) -> dict:
+    p = _state_path(staging_dir, filename)
+    if p.exists():
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return {}
+
+
+def _save_state(staging_dir: Path, filename: str, state: dict) -> None:
+    with open(_state_path(staging_dir, filename), "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _clear_state(staging_dir: Path, filename: str) -> None:
+    p = _state_path(staging_dir, filename)
+    if p.exists():
+        p.unlink()
+
+
+def _initiate_multipart(bucket_url: str, filename: str, token: str) -> str:
+    """Start a new S3 multipart upload. Returns the UploadId string."""
+    r = requests.post(
+        f"{bucket_url}/{filename}?uploads",
+        params={"access_token": token},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        sys.exit(f"Failed to initiate multipart upload: {r.status_code} {r.text}")
+    root = ET.fromstring(r.text)
+    # Strip any XML namespace before searching
+    for el in root.iter():
+        el.tag = el.tag.split("}", 1)[-1] if "}" in el.tag else el.tag
+    node = root.find(".//UploadId")
+    if node is None:
+        sys.exit(f"Could not parse UploadId from response: {r.text}")
+    return node.text
+
+
+def _upload_part(bucket_url: str, filename: str, part_number: int,
+                 upload_id: str, data: bytes, token: str) -> str:
+    """Upload one part of a multipart upload. Returns the ETag."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.put(
+                f"{bucket_url}/{filename}",
+                params={"partNumber": part_number, "uploadId": upload_id,
+                        "access_token": token},
+                data=data,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=600,
+            )
+            if r.status_code == 200:
+                return r.headers["ETag"]
+            print(f"\n  Server error {r.status_code} on part {part_number} "
+                  f"(attempt {attempt}): {r.text[:300]}")
+        except requests.exceptions.ConnectionError as exc:
+            print(f"\n  Connection error on part {part_number} "
+                  f"(attempt {attempt}/{MAX_RETRIES}): {exc}")
+
+        if attempt == MAX_RETRIES:
+            sys.exit(f"Part {part_number} failed after {MAX_RETRIES} retries.")
+
+        wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+        print(f"  Retrying in {wait}s...")
+        time.sleep(wait)
+
+
+def _complete_multipart(bucket_url: str, filename: str,
+                        upload_id: str, parts: list, token: str) -> None:
+    """Tell Zenodo to assemble all parts into a single file."""
+    xml_parts = "\n".join(
+        f"  <Part>\n    <PartNumber>{p['PartNumber']}</PartNumber>"
+        f"\n    <ETag>{p['ETag']}</ETag>\n  </Part>"
+        for p in sorted(parts, key=lambda x: x["PartNumber"])
+    )
+    body = f"<CompleteMultipartUpload>\n{xml_parts}\n</CompleteMultipartUpload>"
+    r = requests.post(
+        f"{bucket_url}/{filename}",
+        params={"uploadId": upload_id, "access_token": token},
+        data=body.encode(),
+        headers={"Content-Type": "application/xml"},
+        timeout=120,
+    )
+    if r.status_code not in (200, 201):
+        sys.exit(f"Failed to complete multipart upload: {r.status_code} {r.text}")
+
+
+def _abort_multipart(bucket_url: str, filename: str,
+                     upload_id: str, token: str) -> None:
+    requests.delete(
+        f"{bucket_url}/{filename}",
+        params={"uploadId": upload_id, "access_token": token},
+        timeout=30,
     )
 
+
+def upload_multipart(bucket_url: str, file_path: Path, token: str,
+                     dry_run: bool, staging_dir: Path) -> None:
+    """
+    Upload a large file using S3 multipart. Zenodo assembles the parts
+    server-side so downloaders see a single file.
+    State is saved to staging_dir/.upload_state_{filename}.json after each
+    part so the upload resumes from where it left off on re-run.
+    """
+    filename = file_path.name
+    total = file_path.stat().st_size
+    n_parts = math.ceil(total / PART_SIZE)
+
+    # If already fully committed, skip
+    existing = remote_file_size(bucket_url, filename, token)
+    if existing == total:
+        print(f"  -> {filename}  ({total / 1024**3:.2f} GB)  [already on Zenodo - skipped]")
+        _clear_state(staging_dir, filename)
+        return
+
+    print(f"  -> {filename}  ({total / 1024**3:.2f} GB)  "
+          f"[S3 multipart: {n_parts} parts x {PART_SIZE // 1024**2} MB]")
     if dry_run:
-        for p in part_names:
-            print(f"     [DRY RUN] {p}")
-        return part_names
+        return
+
+    # Load or create multipart state
+    state = _load_state(staging_dir, filename)
+    upload_id = state.get("upload_id", "")
+    completed_parts = state.get("completed_parts", [])
+    done_part_numbers = {p["PartNumber"] for p in completed_parts}
+
+    if upload_id:
+        print(f"  Resuming upload {upload_id} "
+              f"({len(completed_parts)}/{n_parts} parts already done)")
+    else:
+        upload_id = _initiate_multipart(bucket_url, filename, token)
+        completed_parts = []
+        done_part_numbers = set()
+        state = {"upload_id": upload_id, "filename": filename,
+                 "total_size": total, "n_parts": n_parts, "completed_parts": []}
+        _save_state(staging_dir, filename, state)
+        print(f"  Started multipart upload: {upload_id}")
 
     with open(file_path, "rb") as fh:
-        for i, part_name in enumerate(part_names):
-            fh.seek(i * PART_SIZE)
-            chunk = fh.read(PART_SIZE)
-            expected = len(chunk)
-
-            existing = remote_file_size(bucket_url, part_name, token)
-            if existing == expected:
-                print(f"  [{i + 1:3d}/{n_parts}] {part_name}  ({expected / 1024**2:.1f} MB)  [skipped]")
+        for part_num in range(1, n_parts + 1):
+            if part_num in done_part_numbers:
+                print(f"  [{part_num:3d}/{n_parts}] already uploaded - skipped")
                 continue
 
-            print(f"  [{i + 1:3d}/{n_parts}] {part_name}  ({expected / 1024**2:.1f} MB) ...", end="", flush=True)
+            fh.seek((part_num - 1) * PART_SIZE)
+            chunk = fh.read(PART_SIZE)
+
+            print(f"  [{part_num:3d}/{n_parts}] {len(chunk) / 1024**2:.0f} MB ...",
+                  end="", flush=True)
 
             if HAS_TQDM:
-                bar = tqdm(total=expected, unit="B", unit_scale=True, unit_divisor=1024, leave=False)
+                bar = tqdm(total=len(chunk), unit="B", unit_scale=True,
+                           unit_divisor=1024, leave=False)
 
-            _put_bytes(f"{bucket_url}/{part_name}", chunk, token, part_name)
+            etag = _upload_part(bucket_url, filename, part_num,
+                                upload_id, chunk, token)
 
             if HAS_TQDM:
-                bar.update(expected)
+                bar.update(len(chunk))
                 bar.close()
 
-            print("  done")
+            print(" done")
 
-    return part_names
+            # Persist progress immediately so a crash loses at most one part
+            completed_parts.append({"PartNumber": part_num, "ETag": etag})
+            state["completed_parts"] = completed_parts
+            _save_state(staging_dir, filename, state)
+
+    print("  Completing multipart upload (Zenodo assembling)...", end="", flush=True)
+    _complete_multipart(bucket_url, filename, upload_id, completed_parts, token)
+    print(" done")
+    _clear_state(staging_dir, filename)
+    print(f"  {filename}  uploaded as a single file")
 
 
 def collect_files(staging_dir: Path, repo_root: Path) -> list:
@@ -282,13 +424,10 @@ def main():
     else:
         bucket_url = "https://zenodo.org/api/files/DRY-RUN-BUCKET"
 
-    reassemble_parts = {}
-
     for i, (file_path, label) in enumerate(files, 1):
         print(f"[{i:2d}/{len(files)}] {label}")
         if file_path.stat().st_size > LARGE_FILE_THRESHOLD:
-            parts = upload_in_parts(bucket_url, file_path, token, args.dry_run)
-            reassemble_parts[file_path.name] = parts
+            upload_multipart(bucket_url, file_path, token, args.dry_run, staging_dir)
         else:
             upload_whole_file(bucket_url, file_path, token, args.dry_run)
         print()
@@ -298,13 +437,6 @@ def main():
     else:
         print("All files uploaded successfully.")
         print(f"Review your draft: https://zenodo.org/uploads/{args.deposit_id}")
-
-    if reassemble_parts:
-        print("\n--- Reassembly commands (run after downloading from Zenodo) ---")
-        for original, parts in reassemble_parts.items():
-            print(f"\n# {original}")
-            print(f"cat {' '.join(parts)} > {original}")
-            print(f"# verify: md5sum {original}")
 
 
 if __name__ == "__main__":
